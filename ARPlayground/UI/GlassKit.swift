@@ -1,5 +1,15 @@
 import SwiftUI
 
+/// Builds a Liquid Glass material descriptor. Kept out of any `@ViewBuilder` so
+/// it can do ordinary imperative work. Only available on the iOS 26 SDK.
+@available(iOS 26.0, *)
+private func makeGlass(tint: Color?, interactive: Bool) -> Glass {
+    var glass: Glass = .regular
+    if let tint { glass = glass.tint(tint) }
+    if interactive { glass = glass.interactive() }
+    return glass
+}
+
 /// Liquid Glass helpers. On iOS 26+ these use the real `.glassEffect` material;
 /// on earlier systems they degrade gracefully to a thin material so the app
 /// still builds and runs.
@@ -10,13 +20,10 @@ extension View {
                                tint: Color? = nil,
                                interactive: Bool = false) -> some View {
         if #available(iOS 26.0, *) {
-            var glass: Glass = .regular
-            if let tint { glass = glass.tint(tint) }
-            if interactive { glass = glass.interactive() }
-            self.glassEffect(glass, in: shape)
+            glassEffect(makeGlass(tint: tint, interactive: interactive), in: shape)
         } else {
-            self.background(.ultraThinMaterial, in: shape)
-                .overlay(shape.strokeBorder(.white.opacity(0.15), lineWidth: 0.5))
+            background(.ultraThinMaterial, in: shape)
+                .overlay(shape.stroke(.white.opacity(0.15), lineWidth: 0.5))
         }
     }
 

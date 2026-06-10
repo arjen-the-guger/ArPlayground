@@ -5,6 +5,7 @@ import UIKit
 /// runs entirely on the GPU, so we can emit thousands of soft, rising, fading
 /// puffs cheaply. This is a volumetric *approximation* of gas/smoke (buoyant,
 /// diffusing, light-scattering) rather than a grid-based Navier–Stokes solve.
+@MainActor
 enum ParticleFactory {
 
     /// A rising, expanding, dissipating gas plume anchored at a point.

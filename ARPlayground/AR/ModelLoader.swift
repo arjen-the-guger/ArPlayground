@@ -5,6 +5,10 @@ import UIKit
 /// Loads built-in primitives and arbitrary imported model files, and—critically—
 /// **normalizes their scale** so that an asset authored in centimetres, metres or
 /// inches all arrive at a sane, predictable size in the room.
+///
+/// `@MainActor` because in the iOS 26 SDK `Entity` and its members (`name`,
+/// transforms, etc.) are main-actor isolated.
+@MainActor
 enum ModelLoader {
 
     /// Target longest-edge size in metres for a freshly placed object.

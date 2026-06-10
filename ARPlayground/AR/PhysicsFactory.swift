@@ -4,6 +4,7 @@ import RealityKit
 /// enables `SceneUnderstanding` physics, the scanned real-world mesh becomes a
 /// *static collider* — so these dynamic bodies land on real tables, floors and
 /// walls, not on invisible planes.
+@MainActor
 enum PhysicsFactory {
 
     /// Make an entity a dynamic rigid body that obeys gravity and collides with
@@ -62,5 +63,5 @@ enum PhysicsFactory {
 }
 
 private extension Entity {
-    var collision: CollisionComponent? { components[CollisionComponent.self] }
+    @MainActor var collision: CollisionComponent? { components[CollisionComponent.self] }
 }
