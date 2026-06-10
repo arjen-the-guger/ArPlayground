@@ -1,0 +1,51 @@
+name: ARPlayground
+options:
+  bundleIdPrefix: com.l12
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: "" # <-- put your Apple Developer Team ID here
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "1" # iPhone only
+
+targets:
+  ARPlayground:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - ARPlayground
+    info:
+      path: ARPlayground/Info.plist
+      properties:
+        CFBundleDisplayName: AR Playground
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSCameraUsageDescription: "AR Playground needs the camera to place 3D models, physics, gas and fluids into your real environment."
+        UIRequiredDeviceCapabilities:
+          - arkit
+          - metal
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIStatusBarHidden: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.l12.arplayground
+        GENERATE_INFOPLIST_FILE: false
+
+schemes:
+  ARPlayground:
+    build:
+      targets:
+        ARPlayground: all
+    run:
+      config: Debug
+    archive:
+      config: Release

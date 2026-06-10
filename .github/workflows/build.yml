@@ -1,0 +1,76 @@
+name: Build unsigned IPA
+
+# Builds an installable (unsigned) ARPlayground.ipa on Apple's free macOS
+# runners. Download the artifact and install it on your iPhone from Windows with
+# Sideloadly (it re-signs with your Apple ID during install — no paid cert needed).
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # lets you trigger a build manually from the Actions tab
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The app uses iOS 26 Liquid Glass APIs, so we need the iOS 26 SDK.
+      # Deployment target stays at iOS 18, so the result installs on iOS 18+.
+      - name: Select latest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (no code signing)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ARPlayground.xcodeproj \
+            -scheme ARPlayground \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build | xcpretty || \
+          xcodebuild \
+            -project ARPlayground.xcodeproj \
+            -scheme ARPlayground \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build
+
+      - name: Package .app into .ipa
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/ARPlayground.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Build product not found at $APP_PATH"; exit 1
+          fi
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr ARPlayground.ipa Payload
+          echo "Built $(du -h ARPlayground.ipa | cut -f1) ARPlayground.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARPlayground-ipa
+          path: ARPlayground.ipa
+          if-no-files-found: error

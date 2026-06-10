@@ -1,0 +1,14 @@
+# Xcode / generated project
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Dependencies
+Pods/
+Carthage/Build/

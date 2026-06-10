@@ -1,0 +1,91 @@
+# AR Playground
+
+A native **SwiftUI + ARKit + RealityKit** iPhone app: a sandbox for the real world.
+Drop 3D models into your room, give them realistic lighting / shadows / reflections,
+turn on physics that respects real surfaces, and play with **gas** and **fluid**
+simulations — all wrapped in **Liquid Glass** UI.
+
+> Built on Windows, so it has **not** been compiled here. Open it on a Mac with
+> Xcode 16+ and an iOS 18+ device. See *Limitations* for the honest details on the
+> gas/fluid simulation.
+
+## Features
+
+| Tool | What it does |
+|------|--------------|
+| **Place** | Taps a real surface and drops the selected model. Built-in primitives (sphere/cube/cylinder/cone) or **any imported `.usdz`/`.usd`** file. |
+| **Fling** | Tap a placed object to shove it with a physics impulse. |
+| **Gas** | Emits a buoyant, diffusing GPU particle plume that rises and fades. |
+| **Fluid** | Opens a water source that sprays hundreds of dynamic droplets which pour, pool and splash on the **real** scanned world. |
+| **Erase** | Tap to remove an object. |
+| **Tune** | Gravity, bounciness, imported size, and realism toggles. |
+
+### Realism
+- **Image-based lighting** + **environment reflections** from the live camera feed (`environmentTexturing = .automatic`), so metal and glass mirror your actual room.
+- **Grounding (contact) shadows** under every placed object.
+- A directional key light for crisp, directional shadows.
+- **People occlusion** — real people pass in front of virtual content.
+- On **LiDAR** devices, the room is reconstructed as a mesh that acts as a real **physics collider** and **occluder**: objects land on actual tables/floors, gas drifts around them, fluid pools on real surfaces.
+
+### Scale normalization
+Every model — built-in or imported — is auto-scaled so its **longest edge** matches a
+target size (default 25 cm, adjustable in Settings). A model authored in millimetres,
+metres or inches all arrive sane. See `ModelLoader.normalize`.
+
+### Liquid Glass
+The HUD, tool dock and model tray use the iOS 26 `.glassEffect` material via the
+helpers in `GlassKit.swift`. On iOS 18–25 they **degrade gracefully** to `.ultraThinMaterial`
+so the app still builds and runs.
+
+## Build
+
+You need a Mac + Xcode 16+. Two options:
+
+### A. XcodeGen (recommended)
+```sh
+brew install xcodegen
+cd arplayground
+xcodegen generate
+open ARPlayground.xcodeproj
+```
+Set your Team ID in `project.yml` (or in Xcode → Signing) and run on a **real device**
+(ARKit doesn't work in the Simulator).
+
+### B. Manual
+1. Xcode → New → App (SwiftUI, iOS).
+2. Delete the template `ContentView`/`App` files.
+3. Drag the `ARPlayground/` folder in (Copy items, Create groups).
+4. Use `ARPlayground/Info.plist` (it already has `NSCameraUsageDescription` + `arkit`).
+5. Deployment target iOS 18.0, run on a device.
+
+## Requirements
+- iOS 18.0+ device (iOS 26+ to see real Liquid Glass).
+- Camera permission (prompted on first launch).
+- LiDAR (iPhone 12 Pro and later Pro models) unlocks real-world mesh physics/occlusion. Without it, placement falls back to plane estimation and still works.
+
+## Project layout
+```
+ARPlayground/
+  App/ARPlaygroundApp.swift      App entry
+  State/SceneModel.swift         Observable shared state (tools, settings)
+  AR/
+    ARViewContainer.swift        SwiftUI ↔ ARView bridge + tap gesture
+    ARSessionController.swift     Session config, lighting, shadows, tap routing
+    ModelLoader.swift            Load + scale-normalize models
+    MaterialFactory.swift        PBR materials (matte/metal/glass/rubber)
+    PhysicsFactory.swift         Collision + rigid bodies, impulses
+    ParticleFactory.swift        Gas/smoke GPU particles
+    FluidSystem.swift            Physics-droplet fluid (pooled)
+  UI/
+    ContentView.swift            Composition + file importer
+    TopHUD.swift                 Tracking / mesh / count pill
+    ControlDeck.swift            Tool dock + model/material tray
+    SettingsPanel.swift          Sandbox tuning sheet
+    GlassKit.swift               Liquid Glass helpers + fallback
+```
+
+## Limitations (read me)
+- **Gas** is a volumetric *approximation* via `ParticleEmitterComponent` (buoyant, diffusing, light-scattering particles) — not a grid-based Navier–Stokes solve. It looks right and is cheap; it does not compute pressure/advection.
+- **Fluid** is modeled as many small **dynamic rigid droplets** that genuinely collide with the real-world mesh and each other. This gives real pouring/pooling/splashing behavior, but it is *not* SPH — there's no surface-tension cohesion or a continuous water surface. Droplets are pooled (capped at 600) and recycled for steady performance.
+- A true SPH/FLIP fluid or a fluid-grid gas solver would require a custom **Metal compute** pipeline. That's a natural next step if you want physically-exact simulation; the current design isolates each sim behind a small factory so it can be swapped.
+- **Importing non-USD formats** (`.obj`, `.glb`, `.fbx`) requires converting to `.usdz` first (Apple's *Reality Converter*); RealityKit loads USD natively.
