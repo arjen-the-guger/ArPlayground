@@ -6,7 +6,11 @@ import SwiftUI
 /// active tool's action at the raycast hit point.
 enum PlaygroundTool: String, CaseIterable, Identifiable {
     case place      // drop the selected model / shape
+    case drag       // move an object with your finger, still colliding with the world
+    case transform  // freely translate / rotate / scale, ignoring physics
     case fling      // tap a placed object to push it (physics)
+    case link       // tie two objects together with a constraint
+    case explode    // detonate a radial blast that flings nearby objects
     case gas        // emit rising gas / smoke
     case fluid      // open a fluid (water) source
     case erase      // remove a tapped object
@@ -15,40 +19,52 @@ enum PlaygroundTool: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .place: return "Place"
-        case .fling: return "Fling"
-        case .gas:   return "Gas"
-        case .fluid: return "Fluid"
-        case .erase: return "Erase"
+        case .place:     return "Place"
+        case .drag:      return "Drag"
+        case .transform: return "Transform"
+        case .fling:     return "Fling"
+        case .link:      return "Link"
+        case .explode:   return "Explode"
+        case .gas:       return "Gas"
+        case .fluid:     return "Fluid"
+        case .erase:     return "Erase"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .place: return "cube.transparent"
-        case .fling: return "hand.draw"
-        case .gas:   return "smoke"
-        case .fluid: return "drop"
-        case .erase: return "trash"
+        case .place:     return "cube.transparent"
+        case .drag:      return "arrow.up.and.down.and.arrow.left.and.right"
+        case .transform: return "move.3d"
+        case .fling:     return "hand.draw"
+        case .link:      return "link"
+        case .explode:   return "flame.fill"
+        case .gas:       return "smoke"
+        case .fluid:     return "drop"
+        case .erase:     return "trash"
         }
     }
 
     /// One-line coaching shown above the dock so the active tool is discoverable.
     var instruction: String {
         switch self {
-        case .place: return "Aim at a surface, then tap to place"
-        case .fling: return "Tap a placed object to shove it"
-        case .gas:   return "Aim at a surface, then tap to release gas"
-        case .fluid: return "Aim at a surface, then tap to pour fluid"
-        case .erase: return "Tap a placed object to remove it"
+        case .place:     return "Aim at a surface, then tap to place"
+        case .drag:      return "Drag an object to move it — it still collides"
+        case .transform: return "Tap an object, then drag · pinch · twist to transform"
+        case .fling:     return "Tap a placed object to shove it"
+        case .link:      return "Tap two objects to link them together"
+        case .explode:   return "Tap to set off a blast that flings nearby objects"
+        case .gas:       return "Aim at a surface, then tap to release gas"
+        case .fluid:     return "Aim at a surface, then tap to pour fluid"
+        case .erase:     return "Tap a placed object to remove it"
         }
     }
 
     /// Whether this tool drops content on a real surface (and so uses the reticle).
     var usesSurface: Bool {
         switch self {
-        case .place, .gas, .fluid: return true
-        case .fling, .erase:       return false
+        case .place, .gas, .fluid, .explode: return true
+        case .drag, .transform, .fling, .link, .erase: return false
         }
     }
 }
@@ -119,6 +135,10 @@ final class SceneModel {
     var statusMessage: String?
     var surfaceDetected: Bool = false  // reticle has locked onto a real surface
 
+    // MARK: Capture state
+    var isRecording = false            // a screen recording is in progress
+    var recordingStart: Date?          // when the current recording began
+
     /// Bridge to the imperative RealityKit layer. Set once the AR view loads.
     weak var controller: ARSessionController?
 
@@ -130,6 +150,14 @@ final class SceneModel {
 
     func clearScene() {
         controller?.clearAll()
+    }
+
+    func capturePhoto() {
+        controller?.capturePhoto()
+    }
+
+    func toggleRecording() {
+        controller?.toggleRecording()
     }
 
     func applySettings() {

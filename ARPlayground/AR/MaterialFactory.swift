@@ -23,14 +23,19 @@ enum MaterialFactory {
             return m
 
         case .glass:
-            // Real transparency + refraction reads beautifully against passthrough.
+            // RealityKit exposes no true refraction/IOR parameter, and AR
+            // passthrough can't be sampled behind content — so we sell "glass"
+            // with high transmission plus a mirror-smooth clearcoat that catches
+            // the live room reflections (via `environmentTexturing = .automatic`).
+            // That gives the bright Fresnel edges + see-through body that read as
+            // refraction, even though light isn't physically bent.
             var m = PhysicallyBasedMaterial()
-            m.baseColor = .init(tint: UIColor(white: 1.0, alpha: 1))
-            m.roughness = 0.05
+            m.baseColor = .init(tint: UIColor(red: 0.90, green: 0.96, blue: 1.0, alpha: 1)) // faint cool glass tint
+            m.roughness = 0.0           // mirror-sharp so reflections distort like a lens
             m.metallic = 0.0
-            m.blending = .transparent(opacity: 0.25)
-            m.clearcoat = 1.0
-            m.clearcoatRoughness = 0.05
+            m.blending = .transparent(opacity: 0.15) // mostly see-through
+            m.clearcoat = 1.0           // glossy surface coat = strong edge reflections
+            m.clearcoatRoughness = 0.02
             return m
 
         case .rubber:

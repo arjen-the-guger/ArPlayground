@@ -21,14 +21,25 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                TopHUD()
+                if !model.isRecording { TopHUD() }
                 Spacer()
-                statusToast
-                ControlDeck(showImporter: $showImporter)
-                    .padding(.bottom, 8)
+                if !model.isRecording {
+                    statusToast
+                    ControlDeck(showImporter: $showImporter)
+                        .padding(.bottom, 8)
+                }
             }
             .padding(.horizontal, 14)
             .animation(.spring(duration: 0.3), value: model.statusMessage)
+            .animation(.spring(duration: 0.3), value: model.isRecording)
+
+            // Photo / video capture, pinned to the right edge (vertically
+            // centered so it clears the HUD and dock). Stays up while recording.
+            HStack {
+                Spacer()
+                CaptureControls()
+            }
+            .padding(.trailing, 14)
         }
         .sheet(isPresented: Binding(get: { model.showSettings },
                                     set: { model.showSettings = $0 })) {

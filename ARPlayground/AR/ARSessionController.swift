@@ -36,8 +36,34 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     /// Surface-tracking aiming reticle (a FocusSquare-style pad).
     private let reticle = FocusReticle()
 
+    /// Photo / video capture (ReplayKit screen recording + Photos save).
+    private let recorder = ScreenRecorder()
+
     private var placed: [PlacedObject] = []
     private var gasEmitters: [Entity] = []
+
+    /// Linkages / distance constraints between placed objects.
+    private var linkage: LinkageSystem!
+
+    /// Drag tool state (a kinematic follow that keeps colliding with the world).
+    weak var dragPanRecognizer: UIPanGestureRecognizer?
+    private var draggedBody: ModelEntity?
+    private var dragDistance: Float = 0.5
+    private var dragRestoreMode: PhysicsBodyMode = .dynamic
+    private var dragLastPoint: SIMD3<Float> = .zero
+    private var dragVelocity: SIMD3<Float> = .zero
+    private var dragLastTime: TimeInterval = 0
+
+    /// Transform tool state (free translate / rotate / scale via RealityKit's
+    /// built-in entity gestures, with physics frozen).
+    private var transformGestures: [EntityGestureRecognizer] = []
+    private var transformTarget: ModelEntity?
+
+    /// Link tool state: the first object tapped, awaiting a second.
+    private var pendingLinkSource: ModelEntity?
+
+    /// Tracks tool changes so we can enable/disable gesture modes on transition.
+    private var lastTool: PlaygroundTool = .place
 
     private var updateSubscription: Cancellable?
     private var lastUpdate: TimeInterval = CACurrentMediaTime()
@@ -58,6 +84,7 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         arView.scene.addAnchor(planeRoot)
         worldRoot.addChild(reticle.root)
         fluid = FluidSystem(root: worldRoot)
+        linkage = LinkageSystem(root: worldRoot)
 
         installLighting()
         runConfiguration()
@@ -164,11 +191,28 @@ final class ARSessionController: NSObject, ARSessionDelegate {
                 let now = CACurrentMediaTime()
                 let dt = Float(min(now - self.lastUpdate, 1.0 / 20.0))
                 self.lastUpdate = now
+                self.syncToolMode()
                 self.fluid.update(deltaTime: dt, now: now)
+                self.linkage.update(deltaTime: dt)
                 self.applyGravityCompensation()
                 self.updateReticle()
             }
         }
+    }
+
+    /// React to tool switches: enable the drag gesture only for the Drag tool,
+    /// and tear down any transient selection when leaving Transform / Link.
+    private func syncToolMode() {
+        guard let model, model.tool != lastTool else { return }
+        let old = lastTool
+        let new = model.tool
+        lastTool = new
+
+        dragPanRecognizer?.isEnabled = (new == .drag)
+
+        if old == .transform { clearTransformSelection() }
+        if old == .link { cancelPendingLink() }
+        if old == .drag { endDrag() }
     }
 
     /// Drive the aiming reticle from the screen-centre ray, and surface the
@@ -204,11 +248,34 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     func handleTap(at point: CGPoint) {
         guard let model else { return }
         switch model.tool {
-        case .place: placeAtSurface(point)
-        case .gas:   emitGasAtSurface(point)
-        case .fluid: openFluidSourceAtSurface(point)
-        case .fling: flingObject(at: point)
-        case .erase: eraseObject(at: point)
+        case .place:     placeAtSurface(point)
+        case .drag:      break // handled by the pan recognizer
+        case .transform: selectForTransform(at: point)
+        case .gas:       emitGasAtSurface(point)
+        case .fluid:     openFluidSourceAtSurface(point)
+        case .fling:     flingObject(at: point)
+        case .link:      linkTap(at: point)
+        case .explode:   explode(at: point)
+        case .erase:     eraseObject(at: point)
+        }
+    }
+
+    /// Pan-gesture entry point for the Drag tool (wired from `ARViewContainer`).
+    func handleDrag(state: UIGestureRecognizer.State, at point: CGPoint) {
+        guard model?.tool == .drag else { return }
+        let now = CACurrentMediaTime()
+        switch state {
+        case .began:
+            beginDrag(at: point)
+            dragLastTime = now
+        case .changed:
+            let dt = Float(min(now - dragLastTime, 1.0 / 20.0))
+            dragLastTime = now
+            updateDrag(at: point, deltaTime: dt)
+        case .ended, .cancelled, .failed:
+            endDrag()
+        default:
+            break
         }
     }
 
@@ -344,13 +411,286 @@ final class ARSessionController: NSObject, ARSessionDelegate {
             Haptics.warning()
             return
         }
+        if transformTarget === target.body { clearTransformSelection() }
+        if pendingLinkSource === target.body { cancelPendingLink() }
+        linkage.pruneLinks(removed: target.body)
         target.anchor.removeFromParent()
         placed.removeAll { $0.anchor === target.anchor }
         model?.placedCount = placed.count
         Haptics.impact(.rigid)
     }
 
+    // MARK: Drag tool (physics-respecting move)
+
+    /// Begin dragging the object under the touch. It becomes kinematic so it
+    /// follows the finger precisely while still shoving dynamic objects out of
+    /// the way; on release it resumes its prior mode with the drag's momentum.
+    private func beginDrag(at point: CGPoint) {
+        guard let arView, let target = placedHit(at: point) else {
+            model?.flash("Drag onto an object")
+            Haptics.warning()
+            return
+        }
+        let body = target.body
+        let bodyPos = body.position(relativeTo: nil)
+        dragDistance = max(0.2, simd_distance(bodyPos, arView.cameraTransform.translation))
+        dragRestoreMode = body.components[PhysicsBodyComponent.self]?.mode ?? .dynamic
+        setMode(.kinematic, on: body)
+        dragLastPoint = bodyPos
+        dragVelocity = .zero
+        draggedBody = body
+        Haptics.impact(.soft)
+    }
+
+    private func updateDrag(at point: CGPoint, deltaTime dt: Float) {
+        guard let arView, let body = draggedBody,
+              let ray = arView.ray(through: point) else { return }
+        let target = ray.origin + ray.direction * dragDistance
+        if dt > 0 {
+            dragVelocity = (target - dragLastPoint) / dt
+            // Clamp so a fast flick doesn't launch it across the room.
+            let speed = simd_length(dragVelocity)
+            if speed > 6 { dragVelocity *= 6 / speed }
+        }
+        dragLastPoint = target
+        body.setPosition(target, relativeTo: nil)
+    }
+
+    private func endDrag() {
+        guard let body = draggedBody else { return }
+        draggedBody = nil
+        setMode(dragRestoreMode, on: body)
+        // Hand the released object its drag momentum so it keeps moving / falls.
+        if dragRestoreMode == .dynamic {
+            body.components.set(PhysicsMotionComponent(linearVelocity: dragVelocity,
+                                                       angularVelocity: .zero))
+        }
+    }
+
+    // MARK: Transform tool (free transform, ignores physics)
+
+    /// Select the tapped object for free transforming. Physics is frozen
+    /// (static) so it holds whatever position/rotation/scale you give it, and
+    /// RealityKit's built-in gestures drive translate / rotate / scale.
+    private func selectForTransform(at point: CGPoint) {
+        guard let arView, let target = placedHit(at: point) else {
+            model?.flash("Tap an object to transform")
+            Haptics.warning()
+            return
+        }
+        if transformTarget === target.body { return } // already selected
+        clearTransformSelection()
+        let body = target.body
+        setMode(.static, on: body)
+        transformGestures = arView.installGestures(.all, for: body)
+        transformTarget = body
+        setHighlight(true, on: body)
+        Haptics.impact(.soft)
+        model?.flash("Drag · pinch · twist to transform")
+    }
+
+    private func clearTransformSelection() {
+        // The concrete entity recognizers are all UIGestureRecognizers; cast so
+        // we can disable + detach them regardless of the protocol's declaration.
+        for gesture in transformGestures {
+            guard let recognizer = gesture as? UIGestureRecognizer else { continue }
+            recognizer.isEnabled = false
+            arView?.removeGestureRecognizer(recognizer)
+        }
+        transformGestures.removeAll()
+        if let body = transformTarget { setHighlight(false, on: body) }
+        transformTarget = nil
+    }
+
+    // MARK: Link tool (constraints)
+
+    private func linkTap(at point: CGPoint) {
+        guard let target = placedHit(at: point) else {
+            model?.flash("Tap a placed object")
+            Haptics.warning()
+            return
+        }
+        let body = target.body
+        guard let source = pendingLinkSource else {
+            pendingLinkSource = body
+            setHighlight(true, on: body)
+            Haptics.impact(.soft)
+            model?.flash("Tap a second object to link")
+            return
+        }
+        setHighlight(false, on: source)
+        pendingLinkSource = nil
+        if linkage.link(source, body) {
+            Haptics.success()
+            model?.flash("Linked")
+        } else {
+            Haptics.warning()
+            model?.flash("Pick a different object")
+        }
+    }
+
+    private func cancelPendingLink() {
+        if let source = pendingLinkSource { setHighlight(false, on: source) }
+        pendingLinkSource = nil
+    }
+
+    // MARK: Explode tool
+
+    private let explosionRadius: Float = 1.2
+    private let explosionPower: Float = 3.2
+
+    private func explode(at point: CGPoint) {
+        guard let center = explosionPoint(at: point) else {
+            model?.flash("Aim into the scene")
+            Haptics.warning()
+            return
+        }
+
+        // Radial impulse with distance falloff + an upward kick. Static objects
+        // in range are woken into dynamic bodies so the blast actually tosses them.
+        let physMat = MaterialFactory.physics(model?.material ?? .matte,
+                                              restitution: model?.restitution ?? 0.4)
+        for object in placed {
+            let pos = object.body.position(relativeTo: nil)
+            let offset = pos - center
+            let dist = simd_length(offset)
+            guard dist < explosionRadius else { continue }
+            if object.body.components[PhysicsBodyComponent.self]?.mode != .dynamic {
+                PhysicsFactory.makeDynamic(object.body, material: physMat)
+            }
+            let dir = dist > 1e-3 ? offset / dist : SIMD3<Float>(0, 1, 0)
+            let falloff = 1 - (dist / explosionRadius)
+            let impulse = (dir + SIMD3<Float>(0, 0.6, 0)) * explosionPower * falloff
+            object.body.applyLinearImpulse(impulse, relativeTo: nil)
+        }
+
+        spawnExplosionFX(at: center)
+        Haptics.impact(.heavy)
+        model?.flash("Boom")
+    }
+
+    private func explosionPoint(at point: CGPoint) -> SIMD3<Float>? {
+        if let transform = surfaceTransform(at: point) {
+            return transform.translation
+        }
+        // No surface hit — detonate a fixed distance along the touch ray.
+        guard let ray = arView?.ray(through: point) else { return nil }
+        return ray.origin + ray.direction * 0.8
+    }
+
+    private func spawnExplosionFX(at center: SIMD3<Float>) {
+        let emitter = ParticleFactory.explosion()
+        var transform = Transform()
+        transform.translation = center
+        let anchor = AnchorEntity(.world(transform: transform.matrix))
+        anchor.addChild(emitter)
+        worldRoot.addChild(anchor)
+        // One-shot: stop emitting almost immediately, then clean up.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(120))
+            ParticleFactory.extinguish(emitter)
+            try? await Task.sleep(for: .seconds(1))
+            anchor.removeFromParent()
+        }
+    }
+
+    // MARK: Selection highlight
+
+    /// A faint emissive box fitted around an object to show it's selected /
+    /// pending. Carries no physics, so it never interferes.
+    private func setHighlight(_ on: Bool, on body: ModelEntity) {
+        let name = "selection.highlight"
+        if on {
+            guard !body.children.contains(where: { $0.name == name }) else { return }
+            let bounds = body.visualBounds(relativeTo: body)
+            var mat = PhysicallyBasedMaterial()
+            mat.baseColor = .init(tint: .black)
+            mat.emissiveColor = .init(color: UIColor(red: 0.62, green: 0.55, blue: 0.95, alpha: 1))
+            mat.emissiveIntensity = 1.0
+            mat.roughness = 1.0
+            mat.metallic = 0.0
+            mat.blending = .transparent(opacity: 0.18)
+            let extents = max(bounds.extents, SIMD3<Float>(repeating: 0.02)) * 1.08
+            let box = ModelEntity(mesh: .generateBox(size: extents), materials: [mat])
+            box.position = bounds.center
+            box.name = name
+            body.addChild(box)
+        } else {
+            body.children.filter { $0.name == name }.forEach { $0.removeFromParent() }
+        }
+    }
+
+    private func setMode(_ mode: PhysicsBodyMode, on body: ModelEntity) {
+        guard var component = body.components[PhysicsBodyComponent.self] else { return }
+        component.mode = mode
+        body.components.set(component)
+    }
+
+    // MARK: Capture (photo / video)
+
+    /// Snapshot the rendered AR scene (camera feed + virtual content, without
+    /// the SwiftUI overlay) and save it to the photo library.
+    func capturePhoto() {
+        guard let arView else { return }
+        arView.snapshot(saveToHDR: false) { [weak self] image in
+            Task { @MainActor in
+                guard let self, let model = self.model else { return }
+                guard let image else {
+                    Haptics.warning()
+                    model.flash("Couldn't capture photo")
+                    return
+                }
+                UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+                Haptics.success()
+                model.flash("Photo saved")
+            }
+        }
+    }
+
+    /// Start or stop a screen recording. The UI hides its chrome while recording
+    /// (driven by `model.isRecording`) so the captured video is clean.
+    func toggleRecording() {
+        guard let model else { return }
+        if model.isRecording {
+            // Flip UI back immediately; the save finishes in the background.
+            model.isRecording = false
+            model.recordingStart = nil
+            Haptics.impact(.medium)
+            recorder.stopAndSave { [weak self] result in
+                Task { @MainActor in
+                    guard let model = self?.model else { return }
+                    switch result {
+                    case .success:
+                        Haptics.success()
+                        model.flash("Video saved")
+                    case .failure(let error):
+                        Haptics.warning()
+                        model.flash(error.localizedDescription)
+                    }
+                }
+            }
+        } else {
+            recorder.start { [weak self] started in
+                Task { @MainActor in
+                    guard let model = self?.model else { return }
+                    if started {
+                        model.isRecording = true
+                        model.recordingStart = Date()
+                        Haptics.impact(.medium)
+                    } else {
+                        Haptics.warning()
+                        model.flash("Recording unavailable")
+                    }
+                }
+            }
+        }
+    }
+
     func clearAll() {
+        clearTransformSelection()
+        cancelPendingLink()
+        endDrag()
+        linkage.clear()
         for o in placed { o.anchor.removeFromParent() }
         for g in gasEmitters { g.removeFromParent() }
         placed.removeAll()

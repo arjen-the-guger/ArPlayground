@@ -46,6 +46,40 @@ enum ParticleFactory {
         return entity
     }
 
+    /// A brief fiery burst spraying outward in all directions — the visual half
+    /// of the "explode" tool (the impulse is applied separately to nearby bodies).
+    static func explosion() -> Entity {
+        let entity = Entity()
+        var particles = ParticleEmitterComponent()
+
+        particles.emitterShape = .sphere
+        particles.emitterShapeSize = [0.05, 0.05, 0.05]
+        particles.birthLocation = .volume
+        particles.speed = 1.6
+        particles.speedVariation = 0.8
+
+        var main = particles.mainEmitter
+        main.birthRate = 1800
+        main.size = 0.03
+        main.sizeVariation = 0.02
+        main.lifeSpan = 0.6
+        main.lifeSpanVariation = 0.25
+        main.acceleration = [0, -0.6, 0]      // embers arc and fall
+        main.spreadingAngle = .pi             // full sphere
+        main.billboardMode = .billboard
+        main.color = .evolving(
+            start: .single(UIColor(red: 1.0, green: 0.85, blue: 0.4, alpha: 1.0)),
+            end:   .single(UIColor(red: 0.7, green: 0.2, blue: 0.1, alpha: 0.0))
+        )
+        main.opacityCurve = .quickFadeInOut
+
+        particles.mainEmitter = main
+        particles.isEmitting = true
+        entity.components.set(particles)
+        entity.name = "explosion.emitter"
+        return entity
+    }
+
     /// Stop emitting but let in-flight particles finish their life, then the
     /// caller removes the entity.
     static func extinguish(_ entity: Entity) {

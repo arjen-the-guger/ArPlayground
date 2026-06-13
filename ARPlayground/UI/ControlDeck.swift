@@ -42,18 +42,31 @@ struct ControlDeck: View {
     }
 
     private var toolDock: some View {
-        // Buttons are flexible-width so the dock always fits the screen,
-        // from iPhone SE to Pro Max.
-        HStack(spacing: 4) {
-            ForEach(PlaygroundTool.allCases) { tool in
-                DeckButton(systemImage: tool.systemImage,
-                           title: tool.title,
-                           isActive: model.tool == tool) {
-                    model.tool = tool
+        // The tools scroll horizontally so the dock fits any iPhone no matter
+        // how many tools there are; Clear and Tune stay pinned on the right.
+        HStack(spacing: 6) {
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(PlaygroundTool.allCases) { tool in
+                            DeckButton(systemImage: tool.systemImage,
+                                       title: tool.title,
+                                       isActive: model.tool == tool) {
+                                model.tool = tool
+                            }
+                            .id(tool)
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+                .onChange(of: model.tool) {
+                    withAnimation(.spring(duration: 0.3)) {
+                        proxy.scrollTo(model.tool, anchor: .center)
+                    }
                 }
             }
 
-            Divider().frame(height: 28).overlay(.white.opacity(0.12))
+            Divider().frame(height: 30).overlay(.white.opacity(0.12))
 
             DeckButton(systemImage: "trash", title: "Clear", isActive: false) {
                 model.clearScene()
@@ -86,7 +99,7 @@ struct DeckButton: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
             }
-            .frame(maxWidth: .infinity, minHeight: 46)
+            .frame(width: 58, height: 48)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .foregroundStyle(isActive ? Color.white : Color.primary)
         }
@@ -97,6 +110,7 @@ struct DeckButton: View {
                     .fill(Color.arAccent.opacity(0.9))
             }
         }
+        .animation(.easeOut(duration: 0.18), value: isActive)
     }
 }
 
