@@ -12,38 +12,64 @@ struct ControlDeck: View {
                 ModelTray(showImporter: $showImporter)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            toolHint
             toolDock
         }
         .animation(.spring(duration: 0.32), value: model.tool)
     }
 
+    /// A small coaching pill describing the active tool. For surface tools it
+    /// also shows a live dot that turns green once the reticle locks on.
+    private var toolHint: some View {
+        HStack(spacing: 7) {
+            if model.tool.usesSurface {
+                Circle()
+                    .fill(model.surfaceDetected ? Color.green : Color.orange)
+                    .frame(width: 7, height: 7)
+                    .shadow(color: (model.surfaceDetected ? Color.green : Color.orange).opacity(0.6),
+                            radius: 3)
+            }
+            Text(model.tool.instruction)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .padding(.horizontal, 13).padding(.vertical, 7)
+        .liquidGlassCapsule()
+        .animation(.easeInOut(duration: 0.2), value: model.surfaceDetected)
+        .transition(.opacity)
+    }
+
     private var toolDock: some View {
-        GlassGroup(spacing: 8) {
-            HStack(spacing: 8) {
-                ForEach(PlaygroundTool.allCases) { tool in
-                    DeckButton(systemImage: tool.systemImage,
-                               title: tool.title,
-                               isActive: model.tool == tool) {
-                        model.tool = tool
-                    }
-                }
-
-                Divider().frame(height: 28).overlay(.white.opacity(0.12))
-
-                DeckButton(systemImage: "trash", title: "Clear", isActive: false) {
-                    model.clearScene()
-                }
-                DeckButton(systemImage: "slider.horizontal.3", title: "Tune", isActive: model.showSettings) {
-                    model.showSettings = true
+        // Buttons are flexible-width so the dock always fits the screen,
+        // from iPhone SE to Pro Max.
+        HStack(spacing: 4) {
+            ForEach(PlaygroundTool.allCases) { tool in
+                DeckButton(systemImage: tool.systemImage,
+                           title: tool.title,
+                           isActive: model.tool == tool) {
+                    model.tool = tool
                 }
             }
-            .padding(8)
+
+            Divider().frame(height: 28).overlay(.white.opacity(0.12))
+
+            DeckButton(systemImage: "trash", title: "Clear", isActive: false) {
+                model.clearScene()
+            }
+            DeckButton(systemImage: "slider.horizontal.3", title: "Tune", isActive: model.showSettings) {
+                model.showSettings = true
+            }
         }
+        .padding(6)
+        .frame(maxWidth: .infinity)
         .liquidGlass(RoundedRectangle(cornerRadius: 26, style: .continuous))
     }
 }
 
-/// A square tappable tool button with icon + caption.
+/// A tappable tool button with icon + caption that shares the dock's width
+/// equally with its siblings.
 struct DeckButton: View {
     let systemImage: String
     let title: String
@@ -54,23 +80,23 @@ struct DeckButton: View {
         Button(action: action) {
             VStack(spacing: 3) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.system(size: 17, weight: .semibold))
                 Text(title)
                     .font(.system(size: 9, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
-            .frame(width: 52, height: 46)
+            .frame(maxWidth: .infinity, minHeight: 46)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .foregroundStyle(isActive ? Color.white : Color.primary)
         }
         .buttonStyle(.plain)
         .background {
             if isActive {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .fill(Color.arAccent.opacity(0.9))
             }
         }
-        .liquidGlass(RoundedRectangle(cornerRadius: 16, style: .continuous),
-                     tint: isActive ? .arAccent : nil,
-                     interactive: true)
     }
 }
 
@@ -109,6 +135,7 @@ struct ModelTray: View {
             }
         }
         .padding(10)
+        .frame(maxWidth: .infinity)
         .liquidGlass(RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 }

@@ -32,6 +32,25 @@ enum PlaygroundTool: String, CaseIterable, Identifiable {
         case .erase: return "trash"
         }
     }
+
+    /// One-line coaching shown above the dock so the active tool is discoverable.
+    var instruction: String {
+        switch self {
+        case .place: return "Aim at a surface, then tap to place"
+        case .fling: return "Tap a placed object to shove it"
+        case .gas:   return "Aim at a surface, then tap to release gas"
+        case .fluid: return "Aim at a surface, then tap to pour fluid"
+        case .erase: return "Tap a placed object to remove it"
+        }
+    }
+
+    /// Whether this tool drops content on a real surface (and so uses the reticle).
+    var usesSurface: Bool {
+        switch self {
+        case .place, .gas, .fluid: return true
+        case .fling, .erase:       return false
+        }
+    }
 }
 
 /// Built-in primitive models, plus a marker for "user imported file".
@@ -98,6 +117,7 @@ final class SceneModel {
     var placedCount: Int = 0
     var showSettings = false
     var statusMessage: String?
+    var surfaceDetected: Bool = false  // reticle has locked onto a real surface
 
     /// Bridge to the imperative RealityKit layer. Set once the AR view loads.
     weak var controller: ARSessionController?

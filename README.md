@@ -20,12 +20,20 @@ simulations — all wrapped in **Liquid Glass** UI.
 | **Erase** | Tap to remove an object. |
 | **Tune** | Gravity, bounciness, imported size, and realism toggles. |
 
+### Feel & polish
+- **Surface-tracking reticle** — a soft FocusSquare-style pad follows the real surface under the screen centre, so you always know the app has locked on and where content will land. It only appears for surface tools (Place/Gas/Fluid).
+- **Live "surface ready" dot** in the on-screen hint pill: orange while scanning, green the moment a surface is found.
+- **Contextual hints** — a one-line caption above the dock tells you exactly what the active tool does.
+- **Haptics on every action** — a satisfying tap on place/fling/erase and a warning buzz when you miss a surface or an object.
+- **ARKit coaching overlay** — guides you to pan and scan on launch and whenever tracking is lost.
+
 ### Realism
 - **Image-based lighting** + **environment reflections** from the live camera feed (`environmentTexturing = .automatic`), so metal and glass mirror your actual room.
 - **Grounding (contact) shadows** under every placed object.
 - A directional key light for crisp, directional shadows.
 - **People occlusion** — real people pass in front of virtual content.
 - On **LiDAR** devices, the room is reconstructed as a mesh that acts as a real **physics collider** and **occluder**: objects land on actual tables/floors, gas drifts around them, fluid pools on real surfaces.
+- On devices **without LiDAR**, invisible static colliders are generated from ARKit's detected planes, so ground/table collision still works (just less detailed than the mesh).
 
 ### Scale normalization
 Every model — built-in or imported — is auto-scaled so its **longest edge** matches a
@@ -76,12 +84,14 @@ ARPlayground/
     PhysicsFactory.swift         Collision + rigid bodies, impulses
     ParticleFactory.swift        Gas/smoke GPU particles
     FluidSystem.swift            Physics-droplet fluid (pooled)
+    FocusReticle.swift           Surface-tracking aiming pad
   UI/
     ContentView.swift            Composition + file importer
     TopHUD.swift                 Tracking / mesh / count pill
-    ControlDeck.swift            Tool dock + model/material tray
+    ControlDeck.swift            Tool dock + model/material tray + hint
     SettingsPanel.swift          Sandbox tuning sheet
     GlassKit.swift               Liquid Glass helpers + fallback
+    Haptics.swift                Feedback-generator helpers
 ```
 
 ## Limitations (read me)

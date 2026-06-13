@@ -12,20 +12,39 @@ import QuartzCore
 @MainActor
 final class ARSessionController: NSObject, ARSessionDelegate {
 
+    private struct PlacedObject {
+        let anchor: AnchorEntity
+        let body: ModelEntity
+    }
+
     private weak var arView: ARView?
     private weak var model: SceneModel?
 
-    /// Root for all spawned content; also defines the physics simulation space
-    /// (so we can tune gravity here).
+    /// Root for all spawned content. Content stays in the scene's default
+    /// physics simulation so it collides with the LiDAR mesh and plane colliders.
     private let worldRoot = AnchorEntity(world: .zero)
+
+    /// Invisible static colliders mirroring ARKit's detected planes — the
+    /// ground-collision fallback for devices without LiDAR, and a safety net
+    /// before the LiDAR mesh has streamed in.
+    private let planeRoot = AnchorEntity(world: .zero)
+    private var planeColliders: [UUID: ModelEntity] = [:]
+
     private var sunLight: DirectionalLight?
     private var fluid: FluidSystem!
 
-    private var placedObjects: [Entity] = []
+    /// Surface-tracking aiming reticle (a FocusSquare-style pad).
+    private let reticle = FocusReticle()
+
+    private var placed: [PlacedObject] = []
     private var gasEmitters: [Entity] = []
 
     private var updateSubscription: Cancellable?
     private var lastUpdate: TimeInterval = CACurrentMediaTime()
+
+    /// Gravity the default simulation applies; the slider works by adding a
+    /// per-frame compensation force on top of this.
+    private let defaultGravity: Float = 9.81
 
     // MARK: Setup
 
@@ -36,12 +55,27 @@ final class ARSessionController: NSObject, ARSessionDelegate {
 
         arView.session.delegate = self
         arView.scene.addAnchor(worldRoot)
+        arView.scene.addAnchor(planeRoot)
+        worldRoot.addChild(reticle.root)
         fluid = FluidSystem(root: worldRoot)
 
-        configureWorldSimulation()
         installLighting()
         runConfiguration()
+        installCoaching()
         subscribeToUpdates()
+    }
+
+    /// Apple's coaching overlay: guides the user to pan and scan until ARKit has
+    /// enough to detect surfaces, and reappears if tracking is lost.
+    private func installCoaching() {
+        guard let arView else { return }
+        let coaching = ARCoachingOverlayView()
+        coaching.session = arView.session
+        coaching.goal = .anyPlane
+        coaching.activatesAutomatically = true
+        coaching.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        coaching.frame = arView.bounds
+        arView.addSubview(coaching)
     }
 
     // MARK: ARKit configuration
@@ -95,13 +129,6 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         arView.renderOptions.remove(.disableMotionBlur)
     }
 
-    private func configureWorldSimulation() {
-        // A simulation space lets us control gravity globally.
-        var sim = PhysicsSimulationComponent()
-        sim.gravity = [0, -(model?.gravity ?? 9.81), 0]
-        worldRoot.components.set(sim)
-    }
-
     private func installLighting() {
         // A soft key light gives crisp, directional grounding shadows on top of
         // the ambient image-based lighting from the room.
@@ -121,12 +148,12 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     // MARK: Live settings
 
     func applyWorldSettings() {
-        configureWorldSimulation()
         sunLight?.isEnabled = model?.realisticLighting ?? true
         runConfiguration()
+        // Gravity is read live every frame in the update loop.
     }
 
-    // MARK: Update loop (fluid emission, HUD)
+    // MARK: Update loop (fluid emission, gravity tuning)
 
     private func subscribeToUpdates() {
         guard let arView else { return }
@@ -138,7 +165,37 @@ final class ARSessionController: NSObject, ARSessionDelegate {
                 let dt = Float(min(now - self.lastUpdate, 1.0 / 20.0))
                 self.lastUpdate = now
                 self.fluid.update(deltaTime: dt, now: now)
+                self.applyGravityCompensation()
+                self.updateReticle()
             }
+        }
+    }
+
+    /// Drive the aiming reticle from the screen-centre ray, and surface the
+    /// "surface ready" state to the UI (only on transitions, to avoid churning
+    /// SwiftUI every frame). The reticle only shows for surface-placing tools.
+    private func updateReticle() {
+        guard let arView, let model else { return }
+        let onSurface: Bool
+        if model.tool.usesSurface {
+            onSurface = reticle.update(in: arView)
+        } else {
+            reticle.hide()
+            onSurface = false
+        }
+        if model.surfaceDetected != onSurface { model.surfaceDetected = onSurface }
+    }
+
+    /// The gravity slider: the default simulation always pulls at 9.81 m/s², so
+    /// we add a continuous force making the *net* acceleration match the model.
+    private func applyGravityCompensation() {
+        guard let model else { return }
+        let delta = defaultGravity - model.gravity
+        guard abs(delta) > 0.01 else { return }
+        for object in placed {
+            guard let body = object.body.components[PhysicsBodyComponent.self],
+                  body.mode == .dynamic else { continue }
+            object.body.addForce([0, delta * body.massProperties.mass, 0], relativeTo: nil)
         }
     }
 
@@ -158,20 +215,26 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     // MARK: Tool actions
 
     private func placeAtSurface(_ point: CGPoint) {
-        guard let model, let transform = surfaceTransform(at: point) else {
+        guard let model, var transform = surfaceTransform(at: point) else {
             model?.flash("Aim at a surface")
+            Haptics.warning()
             return
         }
 
         if model.selectedModel == .imported {
             model.flash("Use Import to pick a file")
+            Haptics.warning()
             return
         }
         let material = MaterialFactory.make(model.material)
         let entity = ModelLoader.makePrimitive(model.selectedModel,
                                                size: model.modelScale,
                                                material: material)
+        // Spawn just above the surface so the body doesn't start embedded in
+        // the collider (which makes the solver eject or tunnel it).
+        transform.translation.y += model.modelScale * 0.5 + 0.02
         finishPlacement(of: entity, at: transform, model: model)
+        Haptics.success()
     }
 
     func importModel(from url: URL) {
@@ -183,38 +246,53 @@ final class ARSessionController: NSObject, ARSessionDelegate {
                 // Place in front of the camera at a comfortable distance.
                 let transform = transformInFrontOfCamera(distance: 0.6)
                 finishPlacement(of: entity, at: transform, model: model)
+                Haptics.success()
                 model.flash("Imported \(url.lastPathComponent)")
             } catch {
+                Haptics.warning()
                 model.flash("Import failed: \(error.localizedDescription)")
             }
         }
     }
 
     private func finishPlacement(of entity: Entity, at transform: Transform, model: SceneModel) {
+        // Imported assets are arbitrary hierarchies; wrap them in a ModelEntity
+        // container so the whole object is one physics body we can fling.
+        let body: ModelEntity
+        if let modelEntity = entity as? ModelEntity {
+            body = modelEntity
+        } else {
+            let container = ModelEntity()
+            container.name = "imported.container"
+            container.addChild(entity)
+            body = container
+        }
+
         let anchor = AnchorEntity(.world(transform: transform.matrix))
-        anchor.addChild(entity)
+        anchor.addChild(body)
 
         // Contact (grounding) shadow under the object (applied to every mesh).
         if model.groundingShadows {
-            applyGroundingShadow(to: entity)
+            applyGroundingShadow(to: body)
         }
 
         // Physics: dynamic (falls & collides) or static collider.
         let physMat = MaterialFactory.physics(model.material, restitution: model.restitution)
         if model.physicsEnabled {
-            PhysicsFactory.makeDynamic(entity, material: physMat, mass: 1.0)
+            PhysicsFactory.makeDynamic(body, material: physMat, mass: 1.0)
         } else {
-            PhysicsFactory.makeStatic(entity, material: physMat)
+            PhysicsFactory.makeStatic(body, material: physMat)
         }
 
         worldRoot.addChild(anchor)
-        placedObjects.append(anchor)
-        model.placedCount = placedObjects.count
+        placed.append(PlacedObject(anchor: anchor, body: body))
+        model.placedCount = placed.count
     }
 
     private func emitGasAtSurface(_ point: CGPoint) {
         guard let transform = surfaceTransform(at: point) else {
             model?.flash("Aim at a surface")
+            Haptics.warning()
             return
         }
         let emitter = ParticleFactory.gasEmitter()
@@ -222,12 +300,14 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         anchor.addChild(emitter)
         worldRoot.addChild(anchor)
         gasEmitters.append(anchor)
+        Haptics.impact(.soft)
         model?.flash("Gas plume added")
     }
 
     private func openFluidSourceAtSurface(_ point: CGPoint) {
         guard let transform = surfaceTransform(at: point) else {
             model?.flash("Aim at a surface")
+            Haptics.warning()
             return
         }
         // Emit slightly above the surface, spraying mostly upward + outward so
@@ -237,57 +317,105 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         let camForward = cameraForward()
         let dir = simd_normalize(SIMD3<Float>(camForward.x, 0.6, camForward.z))
         fluid.addSource(at: pos, direction: dir)
+        Haptics.impact(.soft)
         model?.flash("Fluid source opened")
     }
 
     private func flingObject(at point: CGPoint) {
-        guard let arView, let hit = arView.entity(at: point),
-              let root = placedRoot(for: hit) else {
+        guard let target = placedHit(at: point) else {
             model?.flash("Tap a placed object")
+            Haptics.warning()
             return
         }
-        // Push it away from the camera.
-        let forward = cameraForward()
-        let impulse = simd_normalize(forward + [0, 0.3, 0]) * 2.2
-        if let target = root.children.first {
-            // Ensure it's dynamic before pushing.
-            if target.components[PhysicsBodyComponent.self]?.mode != .dynamic {
-                let physMat = MaterialFactory.physics(self.model?.material ?? .matte,
-                                                      restitution: self.model?.restitution ?? 0.4)
-                PhysicsFactory.makeDynamic(target, material: physMat)
-            }
-            PhysicsFactory.push(target, impulse: impulse)
+        // Ensure it's dynamic, then push it away from the camera.
+        if target.body.components[PhysicsBodyComponent.self]?.mode != .dynamic {
+            let physMat = MaterialFactory.physics(model?.material ?? .matte,
+                                                  restitution: model?.restitution ?? 0.4)
+            PhysicsFactory.makeDynamic(target.body, material: physMat)
         }
+        let impulse = simd_normalize(cameraForward() + SIMD3<Float>(0, 0.35, 0)) * 2.2
+        PhysicsFactory.push(target.body, impulse: impulse)
+        Haptics.impact(.medium)
     }
 
     private func eraseObject(at point: CGPoint) {
-        guard let arView, let hit = arView.entity(at: point),
-              let root = placedRoot(for: hit) else {
+        guard let target = placedHit(at: point) else {
             model?.flash("Tap a placed object")
+            Haptics.warning()
             return
         }
-        root.removeFromParent()
-        placedObjects.removeAll { $0 === root }
-        model?.placedCount = placedObjects.count
+        target.anchor.removeFromParent()
+        placed.removeAll { $0.anchor === target.anchor }
+        model?.placedCount = placed.count
+        Haptics.impact(.rigid)
     }
 
     func clearAll() {
-        for o in placedObjects { o.removeFromParent() }
+        for o in placed { o.anchor.removeFromParent() }
         for g in gasEmitters { g.removeFromParent() }
-        placedObjects.removeAll()
+        placed.removeAll()
         gasEmitters.removeAll()
         fluid.clear()
         model?.placedCount = 0
         model?.flash("Scene cleared")
     }
 
-    /// Grounding shadows attach to entities that have a rendered mesh, so we
-    /// walk the whole hierarchy (imported assets may nest many meshes).
-    private func applyGroundingShadow(to entity: Entity) {
-        if entity.components[ModelComponent.self] != nil {
-            entity.components.set(GroundingShadowComponent(castsShadow: true))
+    // MARK: Hit testing
+
+    /// Collision-ray hit test that skips room geometry (LiDAR mesh, plane
+    /// colliders, droplets) and returns the first *placed* object along the ray.
+    /// `entity(at:)` alone returns the nearest collidable, which is usually the
+    /// room itself — that made taps on objects feel broken.
+    private func placedHit(at point: CGPoint) -> PlacedObject? {
+        guard let arView else { return nil }
+        for hit in arView.hitTest(point, query: .all, mask: .all) {
+            var current: Entity? = hit.entity
+            while let entity = current {
+                if let match = placed.first(where: { $0.body === entity || $0.anchor === entity }) {
+                    return match
+                }
+                current = entity.parent
+            }
         }
-        for child in entity.children { applyGroundingShadow(to: child) }
+        return nil
+    }
+
+    // MARK: Plane colliders (non-LiDAR ground physics)
+
+    private func upsertPlaneCollider(for plane: ARPlaneAnchor) {
+        let collider: ModelEntity
+        if let existing = planeColliders[plane.identifier] {
+            collider = existing
+        } else {
+            collider = ModelEntity()
+            collider.name = "plane.collider"
+            planeRoot.addChild(collider)
+            planeColliders[plane.identifier] = collider
+        }
+        collider.transform = Transform(matrix: plane.transform)
+
+        // A thick slab whose top face sits at the plane surface (thickness
+        // resists fast bodies tunneling through).
+        let extent = plane.planeExtent
+        let thickness: Float = 0.05
+        let shape = ShapeResource.generateBox(width: extent.width,
+                                              height: thickness,
+                                              depth: extent.height)
+            .offsetBy(rotation: simd_quatf(angle: extent.rotationOnYAxis, axis: [0, 1, 0]),
+                      translation: plane.center + SIMD3<Float>(0, -thickness / 2, 0))
+        collider.components.set(CollisionComponent(shapes: [shape]))
+        collider.components.set(PhysicsBodyComponent(shapes: [shape],
+                                                     mass: 1.0,
+                                                     material: Self.planeMaterial,
+                                                     mode: .static))
+    }
+
+    /// Friction/restitution for the detected-plane ground colliders. A bit of
+    /// grip so objects settle instead of sliding, and a low bounce.
+    private static let planeMaterial = PhysicsMaterialResource.generate(friction: 0.6, restitution: 0.1)
+
+    private func removePlaneCollider(for plane: ARPlaneAnchor) {
+        planeColliders.removeValue(forKey: plane.identifier)?.removeFromParent()
     }
 
     // MARK: Geometry helpers
@@ -317,14 +445,13 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         return simd_normalize(-SIMD3<Float>(m.columns.2.x, m.columns.2.y, m.columns.2.z))
     }
 
-    /// Walk up the entity hierarchy to the placed anchor we track.
-    private func placedRoot(for entity: Entity) -> Entity? {
-        var current: Entity? = entity
-        while let e = current {
-            if placedObjects.contains(where: { $0 === e }) { return e }
-            current = e.parent
+    /// Grounding shadows attach to entities that have a rendered mesh, so we
+    /// walk the whole hierarchy (imported assets may nest many meshes).
+    private func applyGroundingShadow(to entity: Entity) {
+        if entity.components[ModelComponent.self] != nil {
+            entity.components.set(GroundingShadowComponent(castsShadow: true))
         }
-        return nil
+        for child in entity.children { applyGroundingShadow(to: child) }
     }
 
     // MARK: ARSessionDelegate
@@ -348,8 +475,27 @@ final class ARSessionController: NSObject, ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         let hasMesh = anchors.contains { $0 is ARMeshAnchor }
-        if hasMesh {
-            Task { @MainActor in self.model?.meshAvailable = true }
+        let planes = anchors.compactMap { $0 as? ARPlaneAnchor }
+        guard hasMesh || !planes.isEmpty else { return }
+        Task { @MainActor in
+            if hasMesh { self.model?.meshAvailable = true }
+            for plane in planes { self.upsertPlaneCollider(for: plane) }
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        let planes = anchors.compactMap { $0 as? ARPlaneAnchor }
+        guard !planes.isEmpty else { return }
+        Task { @MainActor in
+            for plane in planes { self.upsertPlaneCollider(for: plane) }
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        let planes = anchors.compactMap { $0 as? ARPlaneAnchor }
+        guard !planes.isEmpty else { return }
+        Task { @MainActor in
+            for plane in planes { self.removePlaneCollider(for: plane) }
         }
     }
 
