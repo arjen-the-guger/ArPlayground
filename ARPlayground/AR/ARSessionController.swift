@@ -1,6 +1,7 @@
 import ARKit
 import RealityKit
 import Combine
+import SwiftUI
 import UIKit
 import simd
 import QuartzCore
@@ -39,6 +40,17 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     /// Photo / video capture (ReplayKit screen recording + Photos save).
     private let recorder = ScreenRecorder()
 
+    /// Free-form 3D paint strokes.
+    private var paint: PaintSystem!
+
+    /// Spray-paint dabs stuck to real surfaces (cleared with the scene).
+    private var sprayDabs: [Entity] = []
+    private var lastSprayPoint: SIMD3<Float>?
+    private let spraySpacing: Float = 0.015
+
+    /// Loaded templates for uploaded files, cloned per placement.
+    private var uploadTemplates: [UUID: Entity] = [:]
+
     private var placed: [PlacedObject] = []
     private var gasEmitters: [Entity] = []
 
@@ -59,8 +71,12 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     private var transformGestures: [EntityGestureRecognizer] = []
     private var transformTarget: ModelEntity?
 
-    /// Link tool state: the first object tapped, awaiting a second.
+    /// Link tool state: the first object tapped, awaiting a second. We remember
+    /// the tapped face both in the body's local space (for the live constraint)
+    /// and in world space (to compute the auto rest length).
     private var pendingLinkSource: ModelEntity?
+    private var pendingLinkLocal: SIMD3<Float> = .zero
+    private var pendingLinkWorld: SIMD3<Float> = .zero
 
     /// Tracks tool changes so we can enable/disable gesture modes on transition.
     private var lastTool: PlaygroundTool = .place
@@ -79,12 +95,21 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         self.model = model
         model.controller = self
 
+        // Register custom components before any mechanical model is spawned.
+        PistonComponent.registerComponent()
+        BearingComponent.registerComponent()
+        GrenadeComponent.registerComponent()
+
         arView.session.delegate = self
         arView.scene.addAnchor(worldRoot)
         arView.scene.addAnchor(planeRoot)
         worldRoot.addChild(reticle.root)
         fluid = FluidSystem(root: worldRoot)
         linkage = LinkageSystem(root: worldRoot)
+        paint = PaintSystem(root: worldRoot)
+
+        // Surface previously uploaded models in the palette.
+        model.uploads = UploadStore.list()
 
         installLighting()
         runConfiguration()
@@ -194,6 +219,7 @@ final class ARSessionController: NSObject, ARSessionDelegate {
                 self.syncToolMode()
                 self.fluid.update(deltaTime: dt, now: now)
                 self.linkage.update(deltaTime: dt)
+                self.updateMechanisms(deltaTime: dt)
                 self.applyGravityCompensation()
                 self.updateReticle()
             }
@@ -208,11 +234,14 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         let new = model.tool
         lastTool = new
 
-        dragPanRecognizer?.isEnabled = (new == .drag)
+        // The single pan recognizer drives Drag, Paint and Spray.
+        dragPanRecognizer?.isEnabled = (new == .drag || new == .paint || new == .spray)
 
         if old == .transform { clearTransformSelection() }
         if old == .link { cancelPendingLink() }
         if old == .drag { endDrag() }
+        if old == .paint { paint.end() }
+        if old == .spray { lastSprayPoint = nil }
     }
 
     /// Drive the aiming reticle from the screen-centre ray, and surface the
@@ -255,14 +284,26 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         case .fluid:     openFluidSourceAtSurface(point)
         case .fling:     flingObject(at: point)
         case .link:      linkTap(at: point)
+        case .unlink:    unlinkTap(at: point)
+        case .paint:     paintTap(at: point)
+        case .spray:     sprayTap(at: point)
         case .explode:   explode(at: point)
         case .erase:     eraseObject(at: point)
         }
     }
 
-    /// Pan-gesture entry point for the Drag tool (wired from `ARViewContainer`).
+    /// Pan-gesture entry point (wired from `ARViewContainer`). The same recognizer
+    /// drives Drag, Paint and Spray depending on the active tool.
     func handleDrag(state: UIGestureRecognizer.State, at point: CGPoint) {
-        guard model?.tool == .drag else { return }
+        switch model?.tool {
+        case .drag:  handleDragMove(state: state, at: point)
+        case .paint: handlePaint(state: state, at: point)
+        case .spray: handleSpray(state: state, at: point)
+        default:     break
+        }
+    }
+
+    private func handleDragMove(state: UIGestureRecognizer.State, at point: CGPoint) {
         let now = CACurrentMediaTime()
         switch state {
         case .began:
@@ -282,47 +323,104 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     // MARK: Tool actions
 
     private func placeAtSurface(_ point: CGPoint) {
-        guard let model, var transform = surfaceTransform(at: point) else {
-            model?.flash("Aim at a surface")
+        guard let model else { return }
+
+        // Uploaded files take a separate (async) path.
+        if model.selectedCategory == .upload {
+            placeUpload(at: point)
+            return
+        }
+
+        guard var transform = surfaceTransform(at: point) else {
+            model.flash("Aim at a surface")
             Haptics.warning()
             return
         }
 
-        if model.selectedModel == .imported {
-            model.flash("Use Import to pick a file")
-            Haptics.warning()
-            return
-        }
+        let kind = model.selectedModel
         let material = MaterialFactory.make(model.material)
-        let entity = ModelLoader.makePrimitive(model.selectedModel,
-                                               size: model.modelScale,
-                                               material: material)
+        let entity = ModelLoader.makeModel(kind, size: model.modelScale, material: material)
         // Spawn just above the surface so the body doesn't start embedded in
         // the collider (which makes the solver eject or tunnel it).
         transform.translation.y += model.modelScale * 0.5 + 0.02
-        finishPlacement(of: entity, at: transform, model: model)
+        finishPlacement(of: entity, at: transform, model: model, kind: kind)
         Haptics.success()
     }
 
-    func importModel(from url: URL) {
+    // MARK: Uploads
+
+    /// Copy a picked file into the persistent store and select it. Done
+    /// synchronously while the picker's security-scoped URL is still valid.
+    func addUpload(from url: URL) {
         guard let model else { return }
+        guard UploadStore.canLoad(url) else {
+            Haptics.warning()
+            model.flash("\(url.pathExtension.uppercased()) isn't supported — convert to .usdz first")
+            return
+        }
+        do {
+            let upload = try UploadStore.add(from: url)
+            model.uploads = UploadStore.list()
+            model.selectedCategory = .upload
+            model.selectedUploadID = upload.id
+            Haptics.success()
+            model.flash("Uploaded \(upload.name)")
+        } catch {
+            Haptics.warning()
+            model.flash("Couldn't import: \(error.localizedDescription)")
+        }
+    }
+
+    func removeUpload(_ upload: UploadedModel) {
+        guard let model else { return }
+        UploadStore.remove(upload)
+        uploadTemplates.removeValue(forKey: upload.id)
+        model.uploads = UploadStore.list()
+        if model.selectedUploadID == upload.id {
+            model.selectedUploadID = model.uploads.first?.id
+        }
+    }
+
+    private func placeUpload(at point: CGPoint) {
+        guard let model else { return }
+        guard let id = model.selectedUploadID,
+              let upload = model.uploads.first(where: { $0.id == id }) else {
+            model.flash("Pick an uploaded file")
+            Haptics.warning()
+            return
+        }
+        guard var transform = surfaceTransform(at: point) else {
+            model.flash("Aim at a surface")
+            Haptics.warning()
+            return
+        }
+        transform.translation.y += model.modelScale * 0.5 + 0.02
+        spawnUpload(upload, at: transform, model: model)
+    }
+
+    /// Place an uploaded model, loading + caching its template on first use and
+    /// cloning it thereafter so repeat placements are instant.
+    private func spawnUpload(_ upload: UploadedModel, at transform: Transform, model: SceneModel) {
+        if let template = uploadTemplates[upload.id] {
+            finishPlacement(of: template.clone(recursive: true), at: transform, model: model, kind: nil)
+            Haptics.success()
+            return
+        }
         Task {
             do {
-                let entity = try await ModelLoader.loadImported(from: url,
-                                                                longestEdge: model.modelScale)
-                // Place in front of the camera at a comfortable distance.
-                let transform = transformInFrontOfCamera(distance: 0.6)
-                finishPlacement(of: entity, at: transform, model: model)
+                let entity = try await ModelLoader.loadFile(upload.url, longestEdge: model.modelScale)
+                uploadTemplates[upload.id] = entity
+                finishPlacement(of: entity.clone(recursive: true), at: transform, model: model, kind: nil)
                 Haptics.success()
-                model.flash("Imported \(url.lastPathComponent)")
             } catch {
                 Haptics.warning()
-                model.flash("Import failed: \(error.localizedDescription)")
+                model.flash("Couldn't load \(upload.name)")
             }
         }
     }
 
-    private func finishPlacement(of entity: Entity, at transform: Transform, model: SceneModel) {
+    private func finishPlacement(of entity: Entity, at transform: Transform,
+                                 model: SceneModel, kind: ModelKind?) {
         // Imported assets are arbitrary hierarchies; wrap them in a ModelEntity
         // container so the whole object is one physics body we can fling.
         let body: ModelEntity
@@ -343,8 +441,14 @@ final class ARSessionController: NSObject, ARSessionDelegate {
             applyGroundingShadow(to: body)
         }
 
-        // Physics: dynamic (falls & collides) or static collider.
-        let physMat = MaterialFactory.physics(model.material, restitution: model.restitution)
+        // Physics: dynamic (falls & collides) or static collider. The basketball
+        // is intentionally bouncy regardless of the slider.
+        let physMat: PhysicsMaterialResource
+        if kind == .basketball {
+            physMat = .generate(friction: 0.5, restitution: 0.85)
+        } else {
+            physMat = MaterialFactory.physics(model.material, restitution: model.restitution)
+        }
         if model.physicsEnabled {
             PhysicsFactory.makeDynamic(body, material: physMat, mass: 1.0)
         } else {
@@ -394,6 +498,13 @@ final class ARSessionController: NSObject, ARSessionDelegate {
             Haptics.warning()
             return
         }
+        let body = target.body
+
+        // Mechanical / throwable objects actuate instead of being shoved.
+        if body.components[PistonComponent.self] != nil { togglePiston(body); return }
+        if body.components[BearingComponent.self] != nil { spinBearing(body); return }
+        if body.components[GrenadeComponent.self] != nil { throwGrenade(body); return }
+
         // Ensure it's dynamic, then push it away from the camera.
         if target.body.components[PhysicsBodyComponent.self]?.mode != .dynamic {
             let physMat = MaterialFactory.physics(model?.material ?? .matte,
@@ -418,6 +529,73 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         placed.removeAll { $0.anchor === target.anchor }
         model?.placedCount = placed.count
         Haptics.impact(.rigid)
+    }
+
+    // MARK: Mechanical / throwable behaviour
+
+    /// Per-frame spin for the two sides of every placed bearing.
+    private func updateMechanisms(deltaTime dt: Float) {
+        guard dt > 0 else { return }
+        for object in placed {
+            guard let bearing = object.body.components[BearingComponent.self] else { continue }
+            spin(object.body, named: "bearing.top", by: bearing.topSpeed * dt)
+            spin(object.body, named: "bearing.bottom", by: bearing.bottomSpeed * dt)
+        }
+    }
+
+    private func spin(_ body: ModelEntity, named name: String, by angle: Float) {
+        guard abs(angle) > 1e-6, let part = body.findEntity(named: name) else { return }
+        part.orientation = part.orientation * simd_quatf(angle: angle, axis: [0, 1, 0])
+    }
+
+    /// Slide a piston's shaft between its collapsed and expanded positions.
+    private func togglePiston(_ body: ModelEntity) {
+        guard var piston = body.components[PistonComponent.self],
+              let shaft = body.findEntity(named: "piston.shaft") else { return }
+        piston.extended.toggle()
+        var target = shaft.transform
+        target.translation.y = piston.extended ? piston.expandedY : piston.collapsedY
+        shaft.move(to: target, relativeTo: shaft.parent, duration: 0.35, timingFunction: .easeInOut)
+        body.components.set(piston)
+        Haptics.impact(.rigid)
+    }
+
+    /// Boost a bearing's spin (alternating direction reads as a real bearing).
+    private func spinBearing(_ body: ModelEntity) {
+        guard var bearing = body.components[BearingComponent.self] else { return }
+        bearing.topSpeed += 2.5
+        bearing.bottomSpeed -= 3.5
+        body.components.set(bearing)
+        Haptics.impact(.medium)
+    }
+
+    /// Throw + arm a grenade; it detonates after a short fuse, then is removed.
+    private func throwGrenade(_ body: ModelEntity) {
+        if body.components[PhysicsBodyComponent.self]?.mode != .dynamic {
+            let physMat = MaterialFactory.physics(.metal, restitution: model?.restitution ?? 0.4)
+            PhysicsFactory.makeDynamic(body, material: physMat)
+        }
+        let impulse = simd_normalize(cameraForward() + SIMD3<Float>(0, 0.4, 0)) * 2.6
+        PhysicsFactory.push(body, impulse: impulse)
+
+        var grenade = body.components[GrenadeComponent.self] ?? GrenadeComponent()
+        guard !grenade.armed else { return }   // already counting down
+        grenade.armed = true
+        body.components.set(grenade)
+        Haptics.impact(.heavy)
+        model?.flash("Grenade armed!")
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1.4))
+            guard let self, body.parent != nil else { return }   // erased before it blew
+            self.detonate(at: body.position(relativeTo: nil))
+            if let object = self.placed.first(where: { $0.body === body }) {
+                self.linkage.pruneLinks(removed: body)
+                object.anchor.removeFromParent()
+                self.placed.removeAll { $0.anchor === object.anchor }
+                self.model?.placedCount = self.placed.count
+            }
+        }
     }
 
     // MARK: Drag tool (physics-respecting move)
@@ -502,36 +680,176 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         transformTarget = nil
     }
 
-    // MARK: Link tool (constraints)
+    // MARK: Link tool (face-to-face constraints)
 
     private func linkTap(at point: CGPoint) {
-        guard let target = placedHit(at: point) else {
-            model?.flash("Tap a placed object")
+        guard let (target, world) = placedHitDetailed(at: point) else {
+            model?.flash("Tap a face on a placed object")
             Haptics.warning()
             return
         }
         let body = target.body
+        let local = body.convert(position: world, from: nil)
+
         guard let source = pendingLinkSource else {
             pendingLinkSource = body
+            pendingLinkLocal = local
+            pendingLinkWorld = world
             setHighlight(true, on: body)
             Haptics.impact(.soft)
-            model?.flash("Tap a second object to link")
+            model?.flash("Tap a face on a second object")
             return
         }
+
         setHighlight(false, on: source)
+        let model = self.model
+        let restLength: Float
+        if model?.linkDistanceAuto ?? true {
+            restLength = simd_distance(pendingLinkWorld, world)
+        } else {
+            restLength = model?.linkDistance ?? 0.2
+        }
+        let gains = linkGains(model?.linkElasticity ?? 0)
+
+        let linked = linkage.link(source, body,
+                                  localA: pendingLinkLocal, localB: local,
+                                  restLength: restLength,
+                                  stiffness: gains.stiffness,
+                                  damping: gains.damping,
+                                  maxForce: gains.maxForce)
         pendingLinkSource = nil
-        if linkage.link(source, body) {
+        if linked {
             Haptics.success()
-            model?.flash("Linked")
+            model?.flash(restLength < 0.02 ? "Joined" : "Linked")
         } else {
             Haptics.warning()
             model?.flash("Pick a different object")
         }
     }
 
+    /// Map the elasticity slider (0 = rigid … 1 = stretchy) to PD gains.
+    private func linkGains(_ elasticity: Float) -> (stiffness: Float, damping: Float, maxForce: Float) {
+        let e = max(0, min(1, elasticity))
+        let stiffness = lerp(320, 45, e)
+        let damping = lerp(34, 4, e)
+        let maxForce = lerp(200, 90, e)
+        return (stiffness, damping, maxForce)
+    }
+
+    private func lerp(_ a: Float, _ b: Float, _ t: Float) -> Float { a + (b - a) * t }
+
     private func cancelPendingLink() {
         if let source = pendingLinkSource { setHighlight(false, on: source) }
         pendingLinkSource = nil
+    }
+
+    // MARK: Unlink tool
+
+    private func unlinkTap(at point: CGPoint) {
+        guard let target = placedHit(at: point) else {
+            model?.flash("Tap a linked object")
+            Haptics.warning()
+            return
+        }
+        let removed = linkage.unlink(target.body)
+        if removed > 0 {
+            Haptics.success()
+            model?.flash("Removed \(removed) link\(removed == 1 ? "" : "s")")
+        } else {
+            Haptics.warning()
+            model?.flash("No links on that object")
+        }
+    }
+
+    // MARK: Paint tool (free-form 3D lines)
+
+    private func handlePaint(state: UIGestureRecognizer.State, at point: CGPoint) {
+        switch state {
+        case .began:
+            beginStroke()
+            paintAddPoint(point)
+        case .changed:
+            paintAddPoint(point)
+        case .ended, .cancelled, .failed:
+            paint.end()
+        default:
+            break
+        }
+    }
+
+    private func paintTap(at point: CGPoint) {
+        beginStroke()
+        paintAddPoint(point)
+        paint.end()
+        Haptics.impact(.light)
+    }
+
+    private func beginStroke() {
+        guard let model else { return }
+        let material = MaterialFactory.paint(UIColor(model.paintColor), kind: model.material)
+        paint.begin(material: material, radius: 0.007)
+    }
+
+    private func paintAddPoint(_ point: CGPoint) {
+        guard let p = paintWorldPoint(at: point) else { return }
+        paint.addPoint(p)
+    }
+
+    /// Paint lands on a real surface if the ray hits one, otherwise floats at a
+    /// fixed distance in front of the camera so you can draw in mid-air.
+    private func paintWorldPoint(at point: CGPoint) -> SIMD3<Float>? {
+        if let transform = surfaceTransform(at: point) {
+            return transform.translation
+        }
+        guard let ray = arView?.ray(through: point) else { return nil }
+        return ray.origin + ray.direction * 0.45
+    }
+
+    // MARK: Spray-paint tool (sticks to flat surfaces)
+
+    private func handleSpray(state: UIGestureRecognizer.State, at point: CGPoint) {
+        switch state {
+        case .began:
+            lastSprayPoint = nil
+            sprayDab(at: point)
+        case .changed:
+            sprayDab(at: point)
+        case .ended, .cancelled, .failed:
+            lastSprayPoint = nil
+        default:
+            break
+        }
+    }
+
+    private func sprayTap(at point: CGPoint) {
+        lastSprayPoint = nil
+        sprayDab(at: point)
+    }
+
+    /// Place one spray dab on the surface under the touch. The dab's size + blur
+    /// scale with the camera→surface distance.
+    private func sprayDab(at point: CGPoint) {
+        guard let arView, let model,
+              let hit = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any).first else {
+            return   // spray only sticks to surfaces
+        }
+        let worldTransform = hit.worldTransform
+        let position = SIMD3<Float>(worldTransform.columns.3.x,
+                                    worldTransform.columns.3.y,
+                                    worldTransform.columns.3.z)
+
+        // Throttle so a drag lays an even line rather than a pile of dabs.
+        if let last = lastSprayPoint, simd_distance(last, position) < spraySpacing { return }
+        lastSprayPoint = position
+
+        let distance = simd_distance(arView.cameraTransform.translation, position)
+        let dab = SprayPaintFactory.dab(color: UIColor(model.paintColor), distance: distance)
+        dab.position.y += 0.002   // lift along the surface normal to avoid z-fighting
+
+        let anchor = AnchorEntity(.world(transform: worldTransform))
+        anchor.addChild(dab)
+        worldRoot.addChild(anchor)
+        sprayDabs.append(anchor)
     }
 
     // MARK: Explode tool
@@ -545,9 +863,14 @@ final class ARSessionController: NSObject, ARSessionDelegate {
             Haptics.warning()
             return
         }
+        detonate(at: center)
+        model?.flash("Boom")
+    }
 
-        // Radial impulse with distance falloff + an upward kick. Static objects
-        // in range are woken into dynamic bodies so the blast actually tosses them.
+    /// The shared blast: a radial impulse with distance falloff + upward kick,
+    /// plus a particle burst. Static objects in range are woken into dynamic
+    /// bodies so the blast actually tosses them. Used by Explode and grenades.
+    private func detonate(at center: SIMD3<Float>) {
         let physMat = MaterialFactory.physics(model?.material ?? .matte,
                                               restitution: model?.restitution ?? 0.4)
         for object in placed {
@@ -566,7 +889,6 @@ final class ARSessionController: NSObject, ARSessionDelegate {
 
         spawnExplosionFX(at: center)
         Haptics.impact(.heavy)
-        model?.flash("Boom")
     }
 
     private func explosionPoint(at point: CGPoint) -> SIMD3<Float>? {
@@ -690,11 +1012,16 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         clearTransformSelection()
         cancelPendingLink()
         endDrag()
+        paint.end()
+        paint.clear()
         linkage.clear()
         for o in placed { o.anchor.removeFromParent() }
         for g in gasEmitters { g.removeFromParent() }
+        for d in sprayDabs { d.removeFromParent() }
         placed.removeAll()
         gasEmitters.removeAll()
+        sprayDabs.removeAll()
+        lastSprayPoint = nil
         fluid.clear()
         model?.placedCount = 0
         model?.flash("Scene cleared")
@@ -707,12 +1034,18 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     /// `entity(at:)` alone returns the nearest collidable, which is usually the
     /// room itself — that made taps on objects feel broken.
     private func placedHit(at point: CGPoint) -> PlacedObject? {
+        placedHitDetailed(at: point)?.object
+    }
+
+    /// Like `placedHit`, but also returns the world-space point on the object's
+    /// surface that was hit (used by the Link tool for face-to-face attachment).
+    private func placedHitDetailed(at point: CGPoint) -> (object: PlacedObject, world: SIMD3<Float>)? {
         guard let arView else { return nil }
         for hit in arView.hitTest(point, query: .all, mask: .all) {
             var current: Entity? = hit.entity
             while let entity = current {
                 if let match = placed.first(where: { $0.body === entity || $0.anchor === entity }) {
-                    return match
+                    return (match, hit.position)
                 }
                 current = entity.parent
             }
@@ -766,17 +1099,6 @@ final class ARSessionController: NSObject, ARSessionDelegate {
         let results = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any)
         guard let first = results.first else { return nil }
         return Transform(matrix: first.worldTransform)
-    }
-
-    private func transformInFrontOfCamera(distance: Float) -> Transform {
-        guard let arView else { return Transform() }
-        let cam = arView.cameraTransform
-        let forward = -SIMD3<Float>(cam.matrix.columns.2.x,
-                                    cam.matrix.columns.2.y,
-                                    cam.matrix.columns.2.z)
-        var t = Transform()
-        t.translation = cam.translation + simd_normalize(forward) * distance
-        return t
     }
 
     private func cameraForward() -> SIMD3<Float> {

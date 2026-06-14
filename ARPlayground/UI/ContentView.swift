@@ -52,7 +52,7 @@ struct ContentView: View {
                       allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls):
-                if let url = urls.first { model.importModel(from: url) }
+                if let url = urls.first { model.addUpload(from: url) }
             case .failure(let error):
                 model.flash("Couldn't open: \(error.localizedDescription)")
             }

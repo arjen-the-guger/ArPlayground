@@ -47,6 +47,33 @@ enum MaterialFactory {
         }
     }
 
+    /// A material for paint strokes: the chosen colour, finished with the chosen
+    /// surface's look (matte / metal / glass / rubber).
+    static func paint(_ color: UIColor, kind: SurfaceMaterial) -> RealityKit.Material {
+        var m = PhysicallyBasedMaterial()
+        m.baseColor = .init(tint: color)
+        switch kind {
+        case .metal:
+            m.metallic = 1.0
+            m.roughness = 0.2
+        case .glass:
+            m.metallic = 0.0
+            m.roughness = 0.0
+            m.blending = .transparent(opacity: 0.45)
+            m.clearcoat = 1.0
+            m.clearcoatRoughness = 0.05
+        case .rubber:
+            m.metallic = 0.0
+            m.roughness = 0.85
+        case .matte:
+            m.metallic = 0.0
+            m.roughness = 0.8
+            m.emissiveColor = .init(color: color)
+            m.emissiveIntensity = 0.25   // a touch of glow so lines pop in AR
+        }
+        return m
+    }
+
     /// Physical surface friction / bounce characteristics per material.
     static func physics(_ kind: SurfaceMaterial, restitution: Float) -> PhysicsMaterialResource {
         switch kind {

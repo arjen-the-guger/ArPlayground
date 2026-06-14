@@ -8,8 +8,11 @@ enum PlaygroundTool: String, CaseIterable, Identifiable {
     case place      // drop the selected model / shape
     case drag       // move an object with your finger, still colliding with the world
     case transform  // freely translate / rotate / scale, ignoring physics
-    case fling      // tap a placed object to push it (physics)
-    case link       // tie two objects together with a constraint
+    case fling      // tap a placed object to push it (physics) / actuate mechanisms
+    case link       // tie two objects together (face-to-face constraint)
+    case unlink     // remove links from a tapped object
+    case paint      // draw free-form 3D lines
+    case spray      // spray soft paint onto real surfaces
     case explode    // detonate a radial blast that flings nearby objects
     case gas        // emit rising gas / smoke
     case fluid      // open a fluid (water) source
@@ -24,6 +27,9 @@ enum PlaygroundTool: String, CaseIterable, Identifiable {
         case .transform: return "Transform"
         case .fling:     return "Fling"
         case .link:      return "Link"
+        case .unlink:    return "Unlink"
+        case .paint:     return "Paint"
+        case .spray:     return "Spray"
         case .explode:   return "Explode"
         case .gas:       return "Gas"
         case .fluid:     return "Fluid"
@@ -38,6 +44,9 @@ enum PlaygroundTool: String, CaseIterable, Identifiable {
         case .transform: return "move.3d"
         case .fling:     return "hand.draw"
         case .link:      return "link"
+        case .unlink:    return "link.badge.plus"
+        case .paint:     return "scribble.variable"
+        case .spray:     return "paintbrush.pointed.fill"
         case .explode:   return "flame.fill"
         case .gas:       return "smoke"
         case .fluid:     return "drop"
@@ -51,8 +60,11 @@ enum PlaygroundTool: String, CaseIterable, Identifiable {
         case .place:     return "Aim at a surface, then tap to place"
         case .drag:      return "Drag an object to move it — it still collides"
         case .transform: return "Tap an object, then drag · pinch · twist to transform"
-        case .fling:     return "Tap a placed object to shove it"
-        case .link:      return "Tap two objects to link them together"
+        case .fling:     return "Tap to shove — or actuate a piston / bearing / grenade"
+        case .link:      return "Tap a face on two objects to link them"
+        case .unlink:    return "Tap a linked object to cut its links"
+        case .paint:     return "Drag to paint a 3D line"
+        case .spray:     return "Drag across a surface to spray — closer is sharper"
         case .explode:   return "Tap to set off a blast that flings nearby objects"
         case .gas:       return "Aim at a surface, then tap to release gas"
         case .fluid:     return "Aim at a surface, then tap to pour fluid"
@@ -64,35 +76,78 @@ enum PlaygroundTool: String, CaseIterable, Identifiable {
     var usesSurface: Bool {
         switch self {
         case .place, .gas, .fluid, .explode: return true
-        case .drag, .transform, .fling, .link, .erase: return false
+        case .drag, .transform, .fling, .link, .unlink, .paint, .spray, .erase: return false
         }
     }
 }
 
-/// Built-in primitive models, plus a marker for "user imported file".
-enum ModelKind: String, CaseIterable, Identifiable {
-    case sphere, cube, cylinder, cone
-    case imported
-
+/// Top-level groupings shown as tabs in the Place palette.
+enum ModelCategory: String, CaseIterable, Identifiable {
+    case primitives, mechanical, throwable, upload
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .sphere:   return "Sphere"
-        case .cube:     return "Cube"
-        case .cylinder: return "Cylinder"
-        case .cone:     return "Cone"
-        case .imported: return "Import"
+        case .primitives: return "Primitives"
+        case .mechanical: return "Mechanical"
+        case .throwable:  return "Throwable"
+        case .upload:     return "Upload"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .sphere:   return "circle.fill"
-        case .cube:     return "cube.fill"
-        case .cylinder: return "cylinder.fill"
-        case .cone:     return "cone.fill"
-        case .imported: return "square.and.arrow.down.fill"
+        case .primitives: return "cube"
+        case .mechanical: return "gearshape.2"
+        case .throwable:  return "burst"
+        case .upload:     return "square.and.arrow.up"
+        }
+    }
+
+    /// Built-in models offered by this category (empty for Upload, which is a
+    /// dynamic list of user files).
+    var models: [ModelKind] {
+        switch self {
+        case .primitives: return [.cube, .sphere, .cylinder, .cone]
+        case .mechanical: return [.piston, .bearing]
+        case .throwable:  return [.grenade, .basketball]
+        case .upload:     return []
+        }
+    }
+}
+
+/// Built-in models across the Primitives / Mechanical / Throwable categories.
+/// (User uploads are tracked separately as `UploadedModel`.)
+enum ModelKind: String, CaseIterable, Identifiable {
+    case sphere, cube, cylinder, cone   // primitives
+    case piston, bearing                // mechanical
+    case grenade, basketball            // throwable
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .sphere:     return "Sphere"
+        case .cube:       return "Cube"
+        case .cylinder:   return "Cylinder"
+        case .cone:       return "Cone"
+        case .piston:     return "Piston"
+        case .bearing:    return "Bearing"
+        case .grenade:    return "Grenade"
+        case .basketball: return "Basketball"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .sphere:     return "circle.fill"
+        case .cube:       return "cube.fill"
+        case .cylinder:   return "cylinder.fill"
+        case .cone:       return "cone.fill"
+        case .piston:     return "pistons"
+        case .bearing:    return "gear"
+        case .grenade:    return "burst.fill"
+        case .basketball: return "basketball.fill"
         }
     }
 }
@@ -112,8 +167,21 @@ final class SceneModel {
 
     // MARK: Tool / palette selection
     var tool: PlaygroundTool = .place
+    var selectedCategory: ModelCategory = .primitives
     var selectedModel: ModelKind = .cube
     var material: SurfaceMaterial = .metal
+
+    // MARK: Uploads (user-imported model files)
+    var uploads: [UploadedModel] = []
+    var selectedUploadID: UUID?
+
+    // MARK: Link tool tuning
+    var linkElasticity: Float = 0      // 0 = rigid strut … 1 = stretchy spring
+    var linkDistanceAuto: Bool = true  // keep the objects' current separation
+    var linkDistance: Float = 0.2      // metres when not auto (0 = join faces)
+
+    // MARK: Paint tool
+    var paintColor: Color = Color(red: 0.95, green: 0.3, blue: 0.3)
 
     // MARK: World simulation settings
     var gravity: Float = 9.81          // m/s², applied to dynamic bodies
@@ -144,8 +212,12 @@ final class SceneModel {
 
     // MARK: Imperative actions (forwarded to the controller)
 
-    func importModel(from url: URL) {
-        controller?.importModel(from: url)
+    func addUpload(from url: URL) {
+        controller?.addUpload(from: url)
+    }
+
+    func removeUpload(_ upload: UploadedModel) {
+        controller?.removeUpload(upload)
     }
 
     func clearScene() {
